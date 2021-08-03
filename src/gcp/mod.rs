@@ -7,7 +7,10 @@ mod jwt;
 use jwt::{Algorithm, Header, Key};
 
 pub mod prelude {
-    pub use super::{MetadataServerProvider, ServiceAccountAccess, ServiceAccountInfo};
+    pub use super::{
+        AuthorizedUserAccess, AuthorizedUserInfo, MetadataServerProvider, ServiceAccountAccess,
+        ServiceAccountInfo,
+    };
     pub use crate::token::{Token, TokenOrRequest, TokenProvider};
 }
 
@@ -52,6 +55,18 @@ pub struct ServiceAccountAccess {
 
 pub struct MetadataServerProvider {
     account_name: String,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct AuthorizedUserInfo {
+    client_id: String,
+    client_secret: String,
+    refresh_token: String,
+}
+
+pub struct AuthorizedUserAccess {
+    info: AuthorizedUserInfo,
+    cache: std::sync::Mutex<Vec<Entry>>,
 }
 
 /// Both the `ServiceAccountAccess` and `MetadataServerProvider` get
@@ -340,6 +355,142 @@ impl TokenProvider for MetadataServerProvider {
 
         // Convert it into our output.
         let token: Token = token_res.into();
+        Ok(token)
+    }
+}
+
+impl AuthorizedUserInfo {
+    /// Deserializes application default credentials from a byte slice. This data is typically
+    /// acquired by reading a JSON file from disk
+    pub fn deserialize<T>(key_data: T) -> Result<Self, Error>
+    where
+        T: AsRef<[u8]>,
+    {
+        let slice = key_data.as_ref();
+
+        let account_info: Self = serde_json::from_slice(slice)?;
+        Ok(account_info)
+    }
+}
+
+impl AuthorizedUserAccess {
+    pub fn new(info: AuthorizedUserInfo) -> Self {
+        Self {
+            info,
+            cache: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+const AUTHORIZED_USER_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+impl TokenProvider for AuthorizedUserAccess {
+    /// Like [`AuthorizedUserAccess::get_token`], but allows the JWT "subject"
+    /// to be passed in.
+    fn get_token_with_subject<'a, S, I, T>(
+        &self,
+        _subject: Option<T>,
+        scopes: I,
+    ) -> Result<TokenOrRequest, Error>
+    where
+        S: AsRef<str> + 'a,
+        I: IntoIterator<Item = &'a S>,
+        T: Into<String>,
+    {
+        let (hash, _scopes) = ServiceAccountAccess::serialize_scopes(scopes.into_iter());
+
+        let reason = {
+            let cache = self.cache.lock().map_err(|_e| Error::Poisoned)?;
+            match cache.binary_search_by(|i| i.hash.cmp(&hash)) {
+                Ok(i) => {
+                    let token = &cache[i].token;
+
+                    if !token.has_expired() {
+                        return Ok(TokenOrRequest::Token(token.clone()));
+                    }
+
+                    RequestReason::Expired
+                }
+                Err(_) => RequestReason::ScopesChanged,
+            }
+        };
+
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", "refresh_token")
+            .append_pair("client_id", &self.info.client_id)
+            .append_pair("client_secret", &self.info.client_secret)
+            .append_pair("refresh_token", &self.info.refresh_token)
+            .finish();
+
+        let body = Vec::from(body);
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(AUTHORIZED_USER_TOKEN_URL)
+            .header(
+                http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .header(http::header::CONTENT_LENGTH, body.len())
+            .body(body)?;
+
+        Ok(TokenOrRequest::Request {
+            reason,
+            request,
+            scope_hash: hash,
+        })
+    }
+
+    /// Handle responses from the token URI request we generated in
+    /// `get_token`. This method deserializes the response and stores
+    /// the token in a local cache, so that future lookups for the
+    /// same scopes don't require new http requests.
+    fn parse_token_response<S>(
+        &self,
+        hash: u64,
+        response: http::Response<S>,
+    ) -> Result<Token, Error>
+    where
+        S: AsRef<[u8]>,
+    {
+        let (parts, body) = response.into_parts();
+
+        if !parts.status.is_success() {
+            let body_bytes = body.as_ref();
+
+            if parts
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|ct| ct.to_str().ok())
+                == Some("application/json; charset=utf-8")
+            {
+                if let Ok(auth_error) = serde_json::from_slice::<error::AuthError>(body_bytes) {
+                    return Err(Error::Auth(auth_error));
+                }
+            }
+
+            return Err(Error::HttpStatus(parts.status));
+        }
+
+        let token_res: TokenResponse = serde_json::from_slice(body.as_ref())?;
+        let token: Token = token_res.into();
+
+        // Last token wins, which...should?...be fine
+        {
+            let mut cache = self.cache.lock().map_err(|_e| Error::Poisoned)?;
+            match cache.binary_search_by(|i| i.hash.cmp(&hash)) {
+                Ok(i) => cache[i].token = token.clone(),
+                Err(i) => {
+                    cache.insert(
+                        i,
+                        Entry {
+                            hash,
+                            token: token.clone(),
+                        },
+                    );
+                }
+            };
+        }
+
         Ok(token)
     }
 }
